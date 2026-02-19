@@ -90,3 +90,24 @@ ILLEGAL_UPPER_BOUND = 235          # Pixel > 235 = too bright
 ILLEGAL_PIXEL_THRESHOLD = 0.01     # 1% pixel illegal per frame dianggap warning
 ILLEGAL_MIN_DURATION = 1           # Minimal 1 frame (langsung warning)
 ILLEGAL_ALWAYS_WARNING = True      # Warning, bukan fail
+
+# =====================================================
+# JITTER DETECTION CONFIG
+# =====================================================
+
+JITTER_AMPLITUDE_THRESHOLD = 3      # Minimal 3 pixel pergeseran
+JITTER_FREQUENCY_THRESHOLD = 10      # Minimal 10 perubahan per detik
+JITTER_MIN_DURATION = 1.0             # Minimal 1 detik
+JITTER_ROI_SIZE = 64                   # Ukuran ROI 64x64 pixel
+JITTER_SEARCH_RANGE = 20               # Range pencarian ±20 pixel
+
+# =====================================================
+# LED FLICKER DETECTION CONFIG
+# =====================================================
+
+LED_FLICKER_FREQS_50HZ = [50, 100]        # Frekuensi untuk 50Hz listrik
+LED_FLICKER_FREQS_60HZ = [60, 120]         # Frekuensi untuk 60Hz listrik
+LED_FLICKER_AMPLITUDE_THRESHOLD = 0.2      # 20% dari sinyal total
+LED_FLICKER_MIN_DURATION = 1.0              # Minimal 1 detik
+LED_FLICKER_DETECT_BOTH = True              # Deteksi kedua frekuensi
+LED_FLICKER_POWER_RATIO = 0.3               # Rasio power terhadap total

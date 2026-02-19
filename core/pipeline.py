@@ -17,6 +17,8 @@ from modules.checks.silence_check import SilenceCheck
 from modules.checks.peak_check import PeakCheck
 from modules.checks.phase_check import PhaseCheck
 from modules.checks.illegal_luminance_check import IllegalLuminanceCheck
+from modules.checks.jitter_check import JitterCheck
+from modules.checks.led_flicker_check import LEDFlickerCheck
 from config import DELETE_TEMP
 
 
@@ -66,14 +68,15 @@ def qc_process_file(file_path, log_callback, progress_callback):
         # =====================================================
         # ANALISIS VIDEO SATU KALI (DENGAN PROGRESS BAR)
         # =====================================================
-        log_callback("Analyzing video (freeze + scratch + flicker + frame drop + illegal luminance)...")
+        log_callback("Analyzing video (freeze + scratch + flicker + frame drop + illegal luminance + jitter + led flicker)...")
 
         # Buat wrapper untuk progress analyzing
         def analyzing_progress(percent):
             progress_callback(percent)  # Pakai progress bar yang sama
 
         analyzer = VideoAnalyzer(temp_file, file_path)  # Pass file asli untuk timestamp
-        freeze_events, scratch_events, flicker_events, drop_events, illegal_events = analyzer.analyze(analyzing_progress)
+        (freeze_events, scratch_events, flicker_events, drop_events, 
+        illegal_events, jitter_events, led_flicker_events) = analyzer.analyze(analyzing_progress)
 
         # Konversi ke timecode untuk display
         freeze_tc = [sec_to_tc(x) for x in freeze_events]
@@ -124,6 +127,19 @@ def qc_process_file(file_path, log_callback, progress_callback):
                 for evt in bright_frames[:3]:  # Tampilkan max 3
                     log_callback(f"     @{evt['timestamp']}s: {evt['percentage']*100:.1f}% pixel > {evt['above']}")
         
+        if jitter_events:
+            has_warning = True
+            log_callback(f"⚠️ JITTER DETECTED: {len(jitter_events)} segment(s)")
+            for evt in jitter_events:
+                log_callback(f"   {evt['start']}s - {evt['end']}s (dur: {evt['duration']}s, amp: {evt['max_amplitude']}px, freq: {evt['frequency']}Hz)")
+        
+        if led_flicker_events:
+            has_warning = True
+            log_callback(f"⚠️ LED FLICKER DETECTED: {len(led_flicker_events)} segment(s)")
+            for evt in led_flicker_events[:5]:
+                log_callback(f"   {evt['start']}s - {evt['end']}s (freq: {evt['frequency']}Hz, power: {evt['power_ratio']*100:.1f}%)")
+
+
         # =====================================================
         # RUN QC CHECKS
         # =====================================================
@@ -136,7 +152,9 @@ def qc_process_file(file_path, log_callback, progress_callback):
             FlickerCheck(),
             FrameDropCheck(),
             IllegalLuminanceCheck(),
-            BlackCheck(),      # Masih pakai ffmpeg
+            JitterCheck(),    
+            LEDFlickerCheck(),  
+            BlackCheck(),      
         ]
         
         # Audio/Metadata checks - PAKAI FILE ASLI
@@ -182,13 +200,24 @@ def qc_process_file(file_path, log_callback, progress_callback):
         "warning": True if illegal_events else False
         }
 
+        all_details["Jitter Detection"] = {
+        "jitter_events": jitter_events,
+        "warning": True if jitter_events else False
+         }
+        
+        all_details["LED Flicker Detection"] = {
+        "led_flicker_events": led_flicker_events,
+        "warning": True if led_flicker_events else False
+        }
+
         # =============================================
         # JALANKAN VIDEO CHECKS LAINNYA (Black)
         # =============================================
         for check in video_checks:
             # Skip freeze, scratch, flicker, drop karena sudah dari analyzer
             if check.name in ["Freeze Detection", "Scratch Detection", "Flicker Detection", 
-                  "Frame Drop Detection", "Illegal Luminance Detection"]:
+                  "Frame Drop Detection", "Illegal Luminance Detection", 
+                  "Jitter Detection", "LED Flicker Detection"]:
                 continue
                 
             log_callback(f"Running {check.name} on downscaled video...")

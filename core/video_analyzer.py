@@ -1,11 +1,19 @@
 """
-
 Video Analyzer - Menganalisis video YUV dalam SATU KALI BACA
-Menangani: Freeze Detection, Scratch Detection, Flicker Detection, Frame Drop Detection, Illegal Luminance
+Menangani: 
+- Freeze Detection
+- Scratch Detection
+- Flicker Detection (umum)
+- Frame Drop Detection
+- Illegal Luminance Detection
+- Jitter Detection
+- LED Flicker Detection (khusus, via FFT)
 
+Semua bersifat WARNING (tidak mengubah status final)
 """
 
 import numpy as np
+import numpy.fft as fft
 import os
 import subprocess
 import json
@@ -21,18 +29,32 @@ from config import (
     DROP_MOTION_THRESHOLD, DROP_TIMESTAMP_GAP,
     FFPROBE_PATH,
     ILLEGAL_LOWER_BOUND, ILLEGAL_UPPER_BOUND,
-    ILLEGAL_PIXEL_THRESHOLD
+    ILLEGAL_PIXEL_THRESHOLD,
+    JITTER_AMPLITUDE_THRESHOLD, JITTER_FREQUENCY_THRESHOLD,
+    JITTER_MIN_DURATION, JITTER_ROI_SIZE,
+    JITTER_SEARCH_RANGE,
+    LED_FLICKER_FREQS_50HZ, LED_FLICKER_FREQS_60HZ,
+    LED_FLICKER_AMPLITUDE_THRESHOLD, LED_FLICKER_MIN_DURATION,
+    LED_FLICKER_DETECT_BOTH, LED_FLICKER_POWER_RATIO
 )
 
 
 class VideoAnalyzer:
     """
     Menganalisis video YUV dalam SATU KALI BACA
-    Menghasilkan: freeze_events, scratch_events, flicker_events, drop_events, illegal_events
+    Menghasilkan: freeze_events, scratch_events, flicker_events, drop_events, 
+                 illegal_events, jitter_events, led_flicker_events
     Semua events bersifat warning (tidak mempengaruhi status final)
     """
     
     def __init__(self, file_path, original_file_path=None):
+        """
+        Inisialisasi VideoAnalyzer dengan file YUV hasil downscale
+        
+        Args:
+            file_path: path ke file YUV (640x360 grayscale)
+            original_file_path: path ke file asli (untuk ffprobe timestamp)
+        """
         self.file_path = file_path
         self.original_file_path = original_file_path or file_path
         self.width = DOWNSCALE_W
@@ -50,6 +72,8 @@ class VideoAnalyzer:
         self.flicker_events = []      # list of dict {start, end, duration, amplitude, frequency}
         self.drop_events = []          # list of dict {timestamp, dropped_frames, gap}
         self.illegal_events = []       # list of dict {timestamp, type, percentage}
+        self.jitter_events = []        # list of dict {start, end, duration, max_amplitude, frequency}
+        self.led_flicker_events = []   # list of dict {start, end, duration, frequency, power_ratio, type}
         
         # Scratch thresholds
         self.contrast_threshold = SCRATCH_CONTRAST_THRESHOLD
@@ -58,7 +82,7 @@ class VideoAnalyzer:
         self.min_vertical_length = int(self.height * MIN_SCRATCH_LENGTH_RATIO)
         self.min_horizontal_length = int(self.width * MIN_SCRATCH_LENGTH_RATIO)
         
-        # Flicker thresholds
+        # Flicker thresholds (umum)
         self.flicker_threshold = FLICKER_THRESHOLD
         self.flicker_min_duration = FLICKER_MIN_DURATION
         self.flicker_min_amplitude = FLICKER_MIN_AMPLITUDE
@@ -75,6 +99,24 @@ class VideoAnalyzer:
         self.illegal_upper = ILLEGAL_UPPER_BOUND
         self.illegal_threshold = ILLEGAL_PIXEL_THRESHOLD
         
+        # Jitter thresholds
+        self.jitter_amplitude = JITTER_AMPLITUDE_THRESHOLD
+        self.jitter_frequency = JITTER_FREQUENCY_THRESHOLD
+        self.jitter_min_duration = JITTER_MIN_DURATION
+        self.jitter_roi_size = JITTER_ROI_SIZE
+        self.jitter_search_range = JITTER_SEARCH_RANGE
+        self.shift_history = []           # list of (timestamp, shift_x)
+        self.reference_roi = None         # ROI dari frame pertama
+        self.reference_roi_pos = None     # Posisi ROI di frame pertama
+        
+        # LED Flicker thresholds
+        self.led_freqs_50hz = LED_FLICKER_FREQS_50HZ
+        self.led_freqs_60hz = LED_FLICKER_FREQS_60HZ
+        self.led_amplitude_threshold = LED_FLICKER_AMPLITUDE_THRESHOLD
+        self.led_min_duration = LED_FLICKER_MIN_DURATION
+        self.led_detect_both = LED_FLICKER_DETECT_BOTH
+        self.led_power_ratio = LED_FLICKER_POWER_RATIO
+        
     def analyze(self, progress_callback=None):
         """
         Analisis video dalam SATU KALI BACA
@@ -83,13 +125,14 @@ class VideoAnalyzer:
             progress_callback: function(percent) untuk update progress (0-100)
             
         Returns:
-            tuple: (freeze_events, scratch_events, flicker_events, drop_events, illegal_events)
+            tuple: (freeze_events, scratch_events, flicker_events, drop_events, 
+                    illegal_events, jitter_events, led_flicker_events)
         """
         
         if self.total_frames == 0:
-            return [], [], [], [], []
+            return [], [], [], [], [], [], []
         
-        # Untuk flicker detection
+        # Untuk flicker detection (umum) dan LED flicker
         brightness_history = []  # Simpan brightness tiap frame
         frame_timestamps = []     # Simpan timestamp tiap frame (estimasi)
         
@@ -111,7 +154,7 @@ class VideoAnalyzer:
                 frame_mean = np.mean(frame)
                 timestamp = frame_number / self.fps  # Estimasi timestamp
                 
-                # Simpan untuk flicker detection
+                # Simpan untuk flicker detection (umum) dan LED flicker
                 brightness_history.append(frame_mean)
                 frame_timestamps.append(timestamp)
                 
@@ -172,6 +215,21 @@ class VideoAnalyzer:
                         "above": self.illegal_upper
                     })
                 
+                # =============================================
+                # 5. JITTER DETECTION
+                # =============================================
+                if frame_number == 0:
+                    # Frame pertama: pilih ROI
+                    self.reference_roi, self.reference_roi_pos = self._select_roi(frame)
+                elif self.reference_roi is not None:
+                    # Frame berikutnya: cross-correlation
+                    shift_x, shift_y, confidence = self._cross_correlate(
+                        frame, self.reference_roi, self.reference_roi_pos
+                    )
+                    # Hanya simpan jika confident
+                    if confidence > 0.7:  # Threshold confidence
+                        self.shift_history.append((timestamp, shift_x))
+                
                 # Update untuk frame berikutnya
                 prev_frame = frame
                 frame_number += 1
@@ -192,15 +250,26 @@ class VideoAnalyzer:
                 self.freeze_events.append(sec)
         
         # =============================================
-        # 5. FLICKER DETECTION (setelah semua frame terbaca)
+        # 6. FLICKER DETECTION (umum) - setelah semua frame terbaca
         # =============================================
         self._detect_flicker(brightness_history, frame_timestamps)
         
         # =============================================
-        # 6. FRAME DROP DETECTION - TAHAP 2 (VERIFIKASI TIMESTAMP)
+        # 7. FRAME DROP DETECTION - TAHAP 2 (VERIFIKASI TIMESTAMP)
         # =============================================
         if self.drop_candidates:
             self._verify_drop_candidates()
+        
+        # =============================================
+        # 8. JITTER DETECTION - ANALISIS
+        # =============================================
+        self._detect_jitter()
+        
+        # =============================================
+        # 9. LED FLICKER DETECTION (khusus, via FFT)
+        # =============================================
+        if len(brightness_history) >= int(self.led_min_duration * self.fps):
+            self.led_flicker_events = self._detect_led_flicker(brightness_history, frame_timestamps)
         
         # =============================================
         # PROGRESS 100% - SELESAI
@@ -208,14 +277,161 @@ class VideoAnalyzer:
         if progress_callback:
             progress_callback(100)
         
-        return self.freeze_events, self.scratch_events, self.flicker_events, self.drop_events, self.illegal_events
+        return (self.freeze_events, self.scratch_events, self.flicker_events, 
+                self.drop_events, self.illegal_events, self.jitter_events,
+                self.led_flicker_events)
+    
+    def _select_roi(self, frame):
+        """
+        Pilih region of interest (ROI) dengan tekstur terkuat
+        
+        Args:
+            frame: numpy array (height, width) dengan nilai 0-255
+            
+        Returns:
+            tuple: (roi, position) dimana position = (x, y)
+        """
+        h, w = frame.shape
+        best_score = -1
+        best_roi = None
+        best_pos = None
+        
+        # Coba beberapa posisi, pilih yang variance tertinggi
+        step = self.jitter_roi_size // 2
+        for y in range(0, h - self.jitter_roi_size, step):
+            for x in range(0, w - self.jitter_roi_size, step):
+                roi = frame[y:y+self.jitter_roi_size, x:x+self.jitter_roi_size]
+                variance = np.var(roi)
+                if variance > best_score:
+                    best_score = variance
+                    best_roi = roi.copy()
+                    best_pos = (x, y)
+        
+        return best_roi, best_pos
+    
+    def _cross_correlate(self, frame, ref_roi, ref_pos):
+        """
+        Cari posisi ROI di frame baru menggunakan cross-correlation
+        
+        Args:
+            frame: numpy array (height, width)
+            ref_roi: numpy array (roi_size, roi_size) referensi
+            ref_pos: tuple (x, y) posisi ROI di frame referensi
+            
+        Returns:
+            tuple: (shift_x, shift_y, confidence)
+        """
+        h, w = frame.shape
+        roi_h, roi_w = ref_roi.shape
+        ref_x, ref_y = ref_pos
+        
+        # Batasi area pencarian
+        x_min = max(0, ref_x - self.jitter_search_range)
+        x_max = min(w - roi_w, ref_x + self.jitter_search_range)
+        y_min = max(0, ref_y - self.jitter_search_range)
+        y_max = min(h - roi_h, ref_y + self.jitter_search_range)
+        
+        best_corr = -1
+        best_x, best_y = ref_x, ref_y
+        
+        # Normalisasi referensi ROI
+        ref_mean = np.mean(ref_roi)
+        ref_std = np.std(ref_roi) + 1e-6
+        ref_norm = (ref_roi - ref_mean) / ref_std
+        
+        # Lakukan pencarian sederhana
+        for y in range(y_min, y_max):
+            for x in range(x_min, x_max):
+                roi = frame[y:y+roi_h, x:x+roi_w]
+                
+                # Normalisasi ROI
+                roi_mean = np.mean(roi)
+                roi_std = np.std(roi) + 1e-6
+                roi_norm = (roi - roi_mean) / roi_std
+                
+                # Hitung cross-correlation
+                corr = np.sum(roi_norm * ref_norm) / (roi_h * roi_w)
+                
+                if corr > best_corr:
+                    best_corr = corr
+                    best_x, best_y = x, y
+        
+        shift_x = best_x - ref_x
+        shift_y = best_y - ref_y
+        
+        return shift_x, shift_y, best_corr
+    
+    def _detect_jitter(self):
+        """
+        Analisis history pergeseran untuk mendeteksi jitter
+        Jitter = pergeseran horizontal dengan amplitude >= threshold,
+                frekuensi >= threshold, durasi >= threshold
+        """
+        if len(self.shift_history) < int(self.jitter_min_duration * self.fps):
+            return
+        
+        timestamps = [t for t, _ in self.shift_history]
+        shifts = [s for _, s in self.shift_history]
+        
+        i = 0
+        while i < len(shifts) - 1:
+            start_idx = i
+            jitter_count = 0
+            changes = []
+            directions = []
+            prev_shift = shifts[i]
+            
+            # Cari segmen dengan perubahan arah
+            while i < len(shifts) - 1:
+                current_shift = shifts[i + 1]
+                
+                # Hitung perubahan
+                if current_shift != prev_shift:
+                    change = abs(current_shift - prev_shift)
+                    if change > 0:
+                        jitter_count += 1
+                        changes.append(change)
+                        directions.append(np.sign(current_shift - prev_shift))
+                        i += 1
+                        prev_shift = current_shift
+                    else:
+                        break
+                else:
+                    i += 1
+                    prev_shift = current_shift
+            
+            # Analisis segmen
+            if jitter_count >= int(self.jitter_frequency * self.jitter_min_duration):
+                start_time = timestamps[start_idx]
+                end_time = timestamps[i] if i < len(timestamps) else timestamps[-1]
+                duration = end_time - start_time
+                
+                if duration >= self.jitter_min_duration:
+                    # Hitung amplitude maksimum
+                    max_amplitude = max(changes) if changes else 0
+                    
+                    if max_amplitude >= self.jitter_amplitude:
+                        # Hitung frekuensi aktual
+                        frequency = jitter_count / duration if duration > 0 else 0
+                        
+                        if frequency >= self.jitter_frequency:
+                            self.jitter_events.append({
+                                "start": round(start_time, 2),
+                                "end": round(end_time, 2),
+                                "duration": round(duration, 2),
+                                "max_amplitude": int(max_amplitude),
+                                "frequency": round(frequency, 2),
+                                "direction": "horizontal"
+                            })
+            else:
+                i += 1
     
     def _detect_flicker(self, brightness_history, timestamps):
         """
-        Deteksi flicker dari history brightness
-        Flicker = perubahan brightness cepat yang berulang
+        Deteksi flicker UMUM dari history brightness
+        Flicker = perubahan brightness cepat yang berulang (tidak spesifik frekuensi)
         
-        Args:   
+        Args:
             brightness_history: list of float (nilai brightness tiap frame)
             timestamps: list of float (timestamp tiap frame)
         """
@@ -267,6 +483,151 @@ class VideoAnalyzer:
                             })
             else:
                 i += 1
+    
+    def _detect_led_flicker(self, brightness_history, timestamps):
+        """
+        Deteksi LED FLICKER (khusus) menggunakan FFT
+        Mencari frekuensi spesifik: 50Hz, 100Hz, 60Hz, 120Hz
+        
+        Args:
+            brightness_history: list of float (brightness per frame)
+            timestamps: list of float (timestamp per frame)
+            
+        Returns:
+            list: led_flicker_events
+        """
+        if len(brightness_history) < int(self.led_min_duration * self.fps):
+            return []
+        
+        events = []
+        
+        # Bagi video menjadi segmen-segmen dengan overlap
+        segment_duration = self.led_min_duration
+        segment_frames = int(segment_duration * self.fps)
+        step_frames = segment_frames // 2  # 50% overlap
+        
+        for start_idx in range(0, len(brightness_history) - segment_frames, step_frames):
+            end_idx = start_idx + segment_frames
+            segment = brightness_history[start_idx:end_idx]
+            
+            # FFT untuk segmen ini
+            freqs, power = self._compute_fft(segment)
+            
+            if len(freqs) == 0:
+                continue
+            
+            # Normalisasi power
+            total_power = np.sum(power)
+            if total_power == 0:
+                continue
+            
+            start_time = timestamps[start_idx]
+            end_time = timestamps[end_idx - 1] if end_idx - 1 < len(timestamps) else timestamps[-1]
+            
+            # Cek frekuensi 50Hz dan 100Hz
+            for freq_target in self.led_freqs_50hz:
+                # Cari frekuensi terdekat
+                idx = np.argmin(np.abs(freqs - freq_target))
+                if np.abs(freqs[idx] - freq_target) < 2:  # Tolerance ±2Hz
+                    power_ratio = power[idx] / total_power
+                    
+                    if power_ratio > self.led_power_ratio:
+                        events.append({
+                            "start": round(start_time, 2),
+                            "end": round(end_time, 2),
+                            "duration": round(end_time - start_time, 2),
+                            "frequency": freq_target,
+                            "power_ratio": round(power_ratio, 3),
+                            "type": "50hz_system"
+                        })
+            
+            # Cek frekuensi 60Hz dan 120Hz
+            if self.led_detect_both:
+                for freq_target in self.led_freqs_60hz:
+                    idx = np.argmin(np.abs(freqs - freq_target))
+                    if np.abs(freqs[idx] - freq_target) < 2:
+                        power_ratio = power[idx] / total_power
+                        
+                        if power_ratio > self.led_power_ratio:
+                            events.append({
+                                "start": round(start_time, 2),
+                                "end": round(end_time, 2),
+                                "duration": round(end_time - start_time, 2),
+                                "frequency": freq_target,
+                                "power_ratio": round(power_ratio, 3),
+                                "type": "60hz_system"
+                            })
+        
+        # Merge events yang berdekatan
+        merged_events = self._merge_led_events(events)
+        
+        return merged_events
+    
+    def _compute_fft(self, signal_data):
+        """
+        Hitung FFT dari sinyal brightness
+        
+        Args:
+            signal_data: list of float (brightness values)
+            
+        Returns:
+            tuple: (frequencies, power_spectrum)
+        """
+        n = len(signal_data)
+        if n < 2 * self.fps:  # Minimal 2 detik untuk resolusi frekuensi cukup
+            return [], []
+        
+        # Detrend (hilangkan DC offset)
+        signal = np.array(signal_data)
+        signal = signal - np.mean(signal)
+        
+        # Windowing (Hann window untuk kurangi spectral leakage)
+        window = np.hanning(n)
+        signal_windowed = signal * window
+        
+        # FFT
+        fft_result = fft.fft(signal_windowed)
+        power = np.abs(fft_result[:n//2]) ** 2
+        
+        # Frekuensi
+        freqs = fft.fftfreq(n, 1/self.fps)[:n//2]
+        
+        return freqs, power
+    
+    def _merge_led_events(self, events):
+        """
+        Gabungkan event LED flicker yang berdekatan
+        
+        Args:
+            events: list of dict
+            
+        Returns:
+            list: merged events
+        """
+        if not events:
+            return []
+        
+        # Urutkan berdasarkan start time
+        events.sort(key=lambda x: x["start"])
+        
+        merged = []
+        current = events[0].copy()
+        
+        for next_event in events[1:]:
+            # Jika frekuensi sama dan gap < 0.5 detik, merge
+            if (next_event["frequency"] == current["frequency"] and 
+                next_event["start"] - current["end"] < 0.5):
+                current["end"] = next_event["end"]
+                current["duration"] = current["end"] - current["start"]
+                # Ambil power ratio tertinggi
+                current["power_ratio"] = max(current["power_ratio"], next_event["power_ratio"])
+            else:
+                merged.append(current)
+                current = next_event.copy()
+        
+        merged.append(current)
+        
+        return merged
     
     def _verify_drop_candidates(self):
         """
@@ -493,9 +854,13 @@ class VideoAnalyzer:
             'flicker_count': len(self.flicker_events),
             'drop_count': len(self.drop_events),
             'illegal_count': len(self.illegal_events),
+            'jitter_count': len(self.jitter_events),
+            'led_flicker_count': len(self.led_flicker_events),
             'freeze_events': self.freeze_events,
             'scratch_events': self.scratch_events,
             'flicker_events': self.flicker_events,
             'drop_events': self.drop_events,
-            'illegal_events': self.illegal_events
+            'illegal_events': self.illegal_events,
+            'jitter_events': self.jitter_events,
+            'led_flicker_events': self.led_flicker_events
         }
