@@ -31,13 +31,8 @@ def process_wrapper(path, result_queue, process_function,
         result = process_function(path)
         result_queue.put(result)
         
-        # =====================================================
-        # TANDAI FILE SEBAGAI SUDAH DIPROSES (PERMANEN)
-        # =====================================================
         with lock:
-            # Load tracking file terbaru
             tracking = load_processed_files()
-            # Tandai file ini sebagai sudah diproses
             mark_file_processed(path, tracking)
             
     finally:
@@ -45,4 +40,4 @@ def process_wrapper(path, result_queue, process_function,
             processing_files.discard(path)
             processed_recently[path] = time.time()
 
-        progress_callback(0)
+        progress_callback(0)  # ← INI YANG RESET KE 0%

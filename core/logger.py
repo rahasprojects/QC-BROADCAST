@@ -35,9 +35,6 @@ def write_csv_row(row):
 
 
 def result_writer_loop(result_queue, log_callback):
-    """
-    Loop untuk menulis hasil QC ke CSV
-    """
     while True:
         result = result_queue.get()
 
@@ -56,14 +53,16 @@ def result_writer_loop(result_queue, log_callback):
             result.get("error", "")
         ])
 
-        # Tampilkan di GUI dengan tanda SELESAI
+        # Tampilkan di GUI dengan ikon sesuai status
         status = result.get("status", "UNKNOWN")
         file_name = result.get("file", "Unknown")
         
         if status == "PASS":
             log_callback(f"✅ SELESAI: {file_name} → {status}")
-        else:
+        elif status == "WARNING":
+            log_callback(f"⚠️ SELESAI: {file_name} → {status}")
+        else:  # FAIL
             log_callback(f"❌ SELESAI: {file_name} → {status}")
         
-        # Tambah garis pemisah biar jelas
-        log_callback("─" * 50)
+        # Tambah garis pemisah
+        log_callback("──────────────────────────────────────────────────")

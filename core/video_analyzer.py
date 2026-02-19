@@ -1,11 +1,14 @@
 """
+
 Video Analyzer - Menganalisis video YUV dalam SATU KALI BACA
-Menangani: Freeze Detection, Scratch Detection, Flicker Detection
-Semua bersifat WARNING (tidak mengubah status final)
+Menangani: Freeze Detection, Scratch Detection, Flicker Detection, Frame Drop Detection, Illegal Luminance
+
 """
 
 import numpy as np
 import os
+import subprocess
+import json
 from config import (
     DOWNSCALE_W, DOWNSCALE_H, ASSUMED_FPS,
     MOTION_GATE, BLACK_GATE,
@@ -14,25 +17,24 @@ from config import (
     MIN_SCRATCH_WIDTH, MAX_SCRATCH_WIDTH,
     MIN_SCRATCH_LENGTH_RATIO,
     FLICKER_THRESHOLD, FLICKER_MIN_DURATION,
-    FLICKER_MIN_AMPLITUDE, FLICKER_MIN_FREQUENCY
+    FLICKER_MIN_AMPLITUDE, FLICKER_MIN_FREQUENCY,
+    DROP_MOTION_THRESHOLD, DROP_TIMESTAMP_GAP,
+    FFPROBE_PATH,
+    ILLEGAL_LOWER_BOUND, ILLEGAL_UPPER_BOUND,
+    ILLEGAL_PIXEL_THRESHOLD
 )
 
 
 class VideoAnalyzer:
     """
     Menganalisis video YUV dalam SATU KALI BACA
-    Menghasilkan: freeze_events, scratch_events, flicker_events
+    Menghasilkan: freeze_events, scratch_events, flicker_events, drop_events, illegal_events
     Semua events bersifat warning (tidak mempengaruhi status final)
     """
     
-    def __init__(self, file_path):
-        """
-        Inisialisasi VideoAnalyzer dengan file YUV hasil downscale
-        
-        Args:
-            file_path: path ke file YUV (640x360 grayscale)
-        """
+    def __init__(self, file_path, original_file_path=None):
         self.file_path = file_path
+        self.original_file_path = original_file_path or file_path
         self.width = DOWNSCALE_W
         self.height = DOWNSCALE_H
         self.fps = ASSUMED_FPS
@@ -46,6 +48,8 @@ class VideoAnalyzer:
         self.freeze_events = []      # list of timestamps (detik)
         self.scratch_events = []      # list of timestamps (detik)
         self.flicker_events = []      # list of dict {start, end, duration, amplitude, frequency}
+        self.drop_events = []          # list of dict {timestamp, dropped_frames, gap}
+        self.illegal_events = []       # list of dict {timestamp, type, percentage}
         
         # Scratch thresholds
         self.contrast_threshold = SCRATCH_CONTRAST_THRESHOLD
@@ -61,28 +65,39 @@ class VideoAnalyzer:
         self.flicker_min_frequency = FLICKER_MIN_FREQUENCY
         self.flicker_min_frames = int(self.flicker_min_duration * self.fps)
         
+        # Frame drop thresholds
+        self.drop_motion_threshold = DROP_MOTION_THRESHOLD
+        self.drop_timestamp_gap = DROP_TIMESTAMP_GAP
+        self.drop_candidates = []      # list of frame numbers mencurigakan
+
+        # Illegal luminance thresholds
+        self.illegal_lower = ILLEGAL_LOWER_BOUND
+        self.illegal_upper = ILLEGAL_UPPER_BOUND
+        self.illegal_threshold = ILLEGAL_PIXEL_THRESHOLD
+        
     def analyze(self, progress_callback=None):
         """
         Analisis video dalam SATU KALI BACA
         
         Args:
-            progress_callback: function(frame_number, total_frames) untuk update progress
+            progress_callback: function(percent) untuk update progress (0-100)
             
         Returns:
-            tuple: (freeze_events, scratch_events, flicker_events)
+            tuple: (freeze_events, scratch_events, flicker_events, drop_events, illegal_events)
         """
         
         if self.total_frames == 0:
-            return [], [], []
+            return [], [], [], [], []
         
         # Untuk flicker detection
         brightness_history = []  # Simpan brightness tiap frame
-        frame_timestamps = []     # Simpan timestamp tiap frame
+        frame_timestamps = []     # Simpan timestamp tiap frame (estimasi)
         
         with open(self.file_path, 'rb') as f:
             prev_frame = None
             freeze_counter = 0
             frame_number = 0
+            last_progress = 0
             
             while True:
                 raw = f.read(self.frame_size)
@@ -94,7 +109,7 @@ class VideoAnalyzer:
                 
                 # Hitung brightness rata-rata frame ini
                 frame_mean = np.mean(frame)
-                timestamp = frame_number / self.fps
+                timestamp = frame_number / self.fps  # Estimasi timestamp
                 
                 # Simpan untuk flicker detection
                 brightness_history.append(frame_mean)
@@ -126,13 +141,50 @@ class VideoAnalyzer:
                 if self._has_scratch(frame):
                     self.scratch_events.append(timestamp)
                 
+                # =============================================
+                # 3. FRAME DROP DETECTION - TAHAP 1 (MOTION)
+                # =============================================
+                if prev_frame is not None:
+                    diff = np.mean(np.abs(frame.astype(np.int16) - prev_frame.astype(np.int16)))
+                    
+                    # Jika perbedaan sangat besar, curiga ada drop
+                    if diff > self.drop_motion_threshold:
+                        self.drop_candidates.append(frame_number)
+                
+                # =============================================
+                # 4. ILLEGAL LUMINANCE DETECTION
+                # =============================================
+                illegal_dark_pct, illegal_bright_pct = self._check_illegal_luminance(frame)
+
+                if illegal_dark_pct > self.illegal_threshold:
+                    self.illegal_events.append({
+                        "timestamp": round(timestamp, 2),
+                        "type": "too_dark",
+                        "percentage": round(illegal_dark_pct, 4),
+                        "below": self.illegal_lower
+                    })
+
+                if illegal_bright_pct > self.illegal_threshold:
+                    self.illegal_events.append({
+                        "timestamp": round(timestamp, 2),
+                        "type": "too_bright",
+                        "percentage": round(illegal_bright_pct, 4),
+                        "above": self.illegal_upper
+                    })
+                
                 # Update untuk frame berikutnya
                 prev_frame = frame
                 frame_number += 1
                 
-                # Progress callback
+                # =============================================
+                # PROGRESS CALLBACK - UPDATE SETIAP FRAME
+                # =============================================
                 if progress_callback and self.total_frames > 0:
-                    progress_callback(int((frame_number / self.total_frames) * 100))
+                    progress = int((frame_number / self.total_frames) * 100)
+                    # Update hanya jika berubah (kurangi frekuensi callback)
+                    if progress != last_progress:
+                        progress_callback(progress)
+                        last_progress = progress
             
             # Cek tail freeze (freeze di akhir video)
             if FREEZE_MIN_FRAMES <= freeze_counter <= FREEZE_MAX_FRAMES:
@@ -140,18 +192,30 @@ class VideoAnalyzer:
                 self.freeze_events.append(sec)
         
         # =============================================
-        # 3. FLICKER DETECTION (setelah semua frame terbaca)
+        # 5. FLICKER DETECTION (setelah semua frame terbaca)
         # =============================================
         self._detect_flicker(brightness_history, frame_timestamps)
         
-        return self.freeze_events, self.scratch_events, self.flicker_events
+        # =============================================
+        # 6. FRAME DROP DETECTION - TAHAP 2 (VERIFIKASI TIMESTAMP)
+        # =============================================
+        if self.drop_candidates:
+            self._verify_drop_candidates()
+        
+        # =============================================
+        # PROGRESS 100% - SELESAI
+        # =============================================
+        if progress_callback:
+            progress_callback(100)
+        
+        return self.freeze_events, self.scratch_events, self.flicker_events, self.drop_events, self.illegal_events
     
     def _detect_flicker(self, brightness_history, timestamps):
         """
         Deteksi flicker dari history brightness
         Flicker = perubahan brightness cepat yang berulang
         
-        Args:
+        Args:   
             brightness_history: list of float (nilai brightness tiap frame)
             timestamps: list of float (timestamp tiap frame)
         """
@@ -203,6 +267,87 @@ class VideoAnalyzer:
                             })
             else:
                 i += 1
+    
+    def _verify_drop_candidates(self):
+        """
+        Verifikasi kandidat drop dengan ffprobe (timestamp)
+        """
+        # Ambil sample kandidat (maksimal 50 untuk efisiensi)
+        candidates = self.drop_candidates[:50]
+        
+        # Dapatkan timestamp dari ffprobe
+        timestamps = self._get_frame_timestamps()
+        
+        if not timestamps or len(timestamps) < 2:
+            return
+        
+        interval_normal = 1.0 / self.fps
+        
+        for frame_num in candidates:
+            if frame_num >= len(timestamps) - 1 or frame_num < 1:
+                continue
+            
+            # Cek gap ke frame berikutnya
+            ts_curr = timestamps[frame_num]
+            ts_next = timestamps[frame_num + 1]
+            
+            gap = ts_next - ts_curr
+            if gap > interval_normal * self.drop_timestamp_gap:
+                # Ada drop setelah frame ini
+                dropped_frames = round(gap / interval_normal) - 1
+                if dropped_frames >= 1:  # Minimal 1 frame drop
+                    self.drop_events.append({
+                        "timestamp": round(ts_curr, 2),
+                        "next_timestamp": round(ts_next, 2),
+                        "gap": round(gap, 3),
+                        "dropped_frames": int(dropped_frames),
+                        "method": "timestamp"
+                    })
+                    continue
+            
+            # Cek gap dari frame sebelumnya
+            ts_prev = timestamps[frame_num - 1]
+            gap = ts_curr - ts_prev
+            if gap > interval_normal * self.drop_timestamp_gap:
+                dropped_frames = round(gap / interval_normal) - 1
+                if dropped_frames >= 1:
+                    self.drop_events.append({
+                        "timestamp": round(ts_prev, 2),
+                        "next_timestamp": round(ts_curr, 2),
+                        "gap": round(gap, 3),
+                        "dropped_frames": int(dropped_frames),
+                        "method": "timestamp"
+                    })
+    
+    def _get_frame_timestamps(self):
+        """
+        Ambil timestamp semua frame menggunakan ffprobe dari file asli
+        """
+        cmd = [
+            FFPROBE_PATH,
+            "-i", self.original_file_path,
+            "-select_streams", "v:0",
+            "-show_entries", "frame=pkt_pts_time",
+            "-of", "json"
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            data = json.loads(result.stdout)
+            
+            timestamps = []
+            for frame in data.get("frames", []):
+                if "pkt_pts_time" in frame:
+                    timestamps.append(float(frame["pkt_pts_time"]))
+            
+            # Jika jumlah timestamp tidak sesuai, gunakan estimasi
+            if len(timestamps) != self.total_frames:
+                return [i / self.fps for i in range(self.total_frames)]
+            
+            return timestamps
+        except Exception as e:
+            # Fallback: gunakan timestamp estimasi dari frame number
+            return [i / self.fps for i in range(self.total_frames)]
     
     def _has_scratch(self, frame):
         """
@@ -310,6 +455,28 @@ class VideoAnalyzer:
             else:
                 length = 0
         return False
+
+    def _check_illegal_luminance(self, frame):
+        """
+        Cek persentase pixel illegal dalam frame
+        
+        Args:
+            frame: numpy array (height, width) dengan nilai 0-255
+            
+        Returns:
+            tuple: (dark_percentage, bright_percentage)
+        """
+        total_pixels = frame.size
+        
+        # Hitung pixel terlalu gelap (< lower bound)
+        dark_pixels = np.sum(frame < self.illegal_lower)
+        dark_percentage = dark_pixels / total_pixels if total_pixels > 0 else 0
+        
+        # Hitung pixel terlalu terang (> upper bound)
+        bright_pixels = np.sum(frame > self.illegal_upper)
+        bright_percentage = bright_pixels / total_pixels if total_pixels > 0 else 0
+        
+        return dark_percentage, bright_percentage
     
     def get_summary(self):
         """
@@ -324,7 +491,11 @@ class VideoAnalyzer:
             'freeze_count': len(self.freeze_events),
             'scratch_count': len(self.scratch_events),
             'flicker_count': len(self.flicker_events),
+            'drop_count': len(self.drop_events),
+            'illegal_count': len(self.illegal_events),
             'freeze_events': self.freeze_events,
             'scratch_events': self.scratch_events,
-            'flicker_events': self.flicker_events
+            'flicker_events': self.flicker_events,
+            'drop_events': self.drop_events,
+            'illegal_events': self.illegal_events
         }

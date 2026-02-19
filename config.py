@@ -71,3 +71,22 @@ FLICKER_MIN_DURATION = 2.0       # minimal 2 detik
 FLICKER_MIN_AMPLITUDE = 0.3      # 30% amplitude dari rata-rata
 FLICKER_ALWAYS_WARNING = True    # Selalu warning, bukan fail
 FLICKER_MIN_FREQUENCY = 8        # minimal 8 perubahan per detik
+
+# =====================================================
+# FRAME DROP DETECTION CONFIG
+# =====================================================
+
+DROP_MOTION_THRESHOLD = 15.0       # Perbedaan motion yang mencurigakan
+DROP_TIMESTAMP_GAP = 1.5            # 1.5x interval normal dianggap drop
+DROP_VERIFY_SEGMENTS = True         # Verifikasi dengan ffprobe
+DROP_MIN_GAP_FRAMES = 1              # Minimal 1 frame drop
+
+# =====================================================
+# ILLEGAL LUMINANCE DETECTION CONFIG
+# =====================================================
+
+ILLEGAL_LOWER_BOUND = 16           # Pixel < 16 = too dark
+ILLEGAL_UPPER_BOUND = 235          # Pixel > 235 = too bright
+ILLEGAL_PIXEL_THRESHOLD = 0.01     # 1% pixel illegal per frame dianggap warning
+ILLEGAL_MIN_DURATION = 1           # Minimal 1 frame (langsung warning)
+ILLEGAL_ALWAYS_WARNING = True      # Warning, bukan fail
