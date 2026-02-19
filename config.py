@@ -60,3 +60,14 @@ SCRATCH_CONTRAST_THRESHOLD = 0.5      # 50% lebih terang/gelap (lebih toleran)
 MIN_SCRATCH_WIDTH = 2                  # minimal 2 pixel (hindari noise)
 MAX_SCRATCH_WIDTH = 5                  # maksimal 5 pixel
 MIN_SCRATCH_LENGTH_RATIO = 0.3        # minimal 30% dari frame
+
+
+# =====================================================
+# FLICKER DETECTION CONFIG - TAMBAHKAN INI
+# =====================================================
+
+FLICKER_THRESHOLD = 0.3          # 30% perubahan brightness
+FLICKER_MIN_DURATION = 2.0       # minimal 2 detik
+FLICKER_MIN_AMPLITUDE = 0.3      # 30% amplitude dari rata-rata
+FLICKER_ALWAYS_WARNING = True    # Selalu warning, bukan fail
+FLICKER_MIN_FREQUENCY = 8        # minimal 8 perubahan per detik

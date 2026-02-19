@@ -9,6 +9,7 @@ from utils.time_utils import sec_to_tc
 from core.video_analyzer import VideoAnalyzer
 from modules.checks.freeze_check import FreezeCheck
 from modules.checks.scratch_check import ScratchCheck
+from modules.checks.flicker_check import FlickerCheck
 from modules.checks.scan_type_check import ScanTypeCheck
 from modules.checks.black_check import BlackCheck
 from modules.checks.silence_check import SilenceCheck
@@ -20,6 +21,7 @@ from config import DELETE_TEMP
 def qc_process_file(file_path, log_callback, progress_callback):
     """
     Proses QC untuk satu file MXF
+    Semua check bersifat WARNING (tidak mengubah status final)
     """
     temp_file = None
     
@@ -40,7 +42,7 @@ def qc_process_file(file_path, log_callback, progress_callback):
         if not valid:
             return {
                 "file": file_name,
-                "status": "FAIL",
+                "status": "FAIL",  # Metadata FAIL tetap FAIL
                 "freeze": [],
                 "details": {},
                 "error": err
@@ -56,20 +58,25 @@ def qc_process_file(file_path, log_callback, progress_callback):
         log_callback(f"Downscale complete: {os.path.basename(temp_file)}")
         
         # =====================================================
-        # ANALISIS VIDEO SATU KALI (FREEZE + SCRATCH)
+        # ANALISIS VIDEO SATU KALI (FREEZE + SCRATCH + FLICKER)
         # =====================================================
-        log_callback("Analyzing video (freeze + scratch)...")
+        log_callback("Analyzing video (freeze + scratch + flicker)...")
         analyzer = VideoAnalyzer(temp_file)        
-        freeze_events, scratch_events = analyzer.analyze()
+        freeze_events, scratch_events, flicker_events = analyzer.analyze()
 
         # Konversi ke timecode untuk display
         freeze_tc = [sec_to_tc(x) for x in freeze_events]
         scratch_tc = [sec_to_tc(x) for x in scratch_events]
         
+        # Tampilkan warning di log
         if freeze_events:
-            log_callback(f"FREEZE DETECTED @ {freeze_tc}")
+            log_callback(f"⚠️ FREEZE DETECTED @ {freeze_tc}")
         if scratch_events:
-            log_callback(f"SCRATCH DETECTED @ {scratch_tc}")
+            log_callback(f"⚠️ SCRATCH DETECTED @ {scratch_tc}")
+        if flicker_events:
+            log_callback(f"⚠️ FLICKER DETECTED: {len(flicker_events)} segment(s)")
+            for evt in flicker_events:
+                log_callback(f"   {evt['start']}s - {evt['end']}s (dur: {evt['duration']}s, amp: {evt['amplitude']}, freq: {evt['frequency']}Hz)")
         
         # =====================================================
         # RUN QC CHECKS
@@ -80,6 +87,7 @@ def qc_process_file(file_path, log_callback, progress_callback):
         video_checks = [
             FreezeCheck(),
             ScratchCheck(),
+            FlickerCheck(),
             BlackCheck(),      # Masih pakai ffmpeg
         ]
         
@@ -91,6 +99,7 @@ def qc_process_file(file_path, log_callback, progress_callback):
             PhaseCheck(),      # audio
         ]
 
+        # Status final tetap PASS selama metadata valid (karena semua warning)
         final_status = "PASS"
         all_details = {}
         all_freeze = freeze_tc  # Langsung dari analyzer
@@ -101,43 +110,36 @@ def qc_process_file(file_path, log_callback, progress_callback):
         # =============================================
         all_details["Freeze Detection"] = {
             "freeze_frames": freeze_tc,
-            "freeze_timestamps": freeze_events
+            "freeze_timestamps": freeze_events,
+            "warning": True if freeze_events else False
         }
         
         all_details["Scratch Detection"] = {
             "scratch_frames": scratch_tc,
-            "scratch_timestamps": scratch_events
+            "scratch_timestamps": scratch_events,
+            "warning": True if scratch_events else False
         }
         
-        # Tentukan status berdasarkan freeze/scratch
-        if freeze_events:
-            final_status = "FAIL"
-            error_msg = f"Freeze detected at {', '.join(freeze_tc[:3])}"
-            if len(freeze_tc) > 3:
-                error_msg += f" and {len(freeze_tc)-3} more"
+        all_details["Flicker Detection"] = {
+            "flicker_events": flicker_events,
+            "warning": True if flicker_events else False
+        }
         
-        if scratch_events:
-            final_status = "FAIL"
-            error_msg = f"Scratch detected at {', '.join(scratch_tc[:3])}"
-            if len(scratch_tc) > 3:
-                error_msg += f" and {len(scratch_tc)-3} more"
-
         # =============================================
         # JALANKAN VIDEO CHECKS LAINNYA (Black)
         # =============================================
         for check in video_checks:
-            # Skip freeze & scratch karena sudah dari analyzer
-            if check.name in ["Freeze Detection", "Scratch Detection"]:
+            # Skip freeze, scratch, flicker karena sudah dari analyzer
+            if check.name in ["Freeze Detection", "Scratch Detection", "Flicker Detection"]:
                 continue
                 
             log_callback(f"Running {check.name} on downscaled video...")
             result = check.run(temp_file, log_callback, lambda x: None)
             all_details[check.name] = result.get("details", {})
             
-            if result["status"] == "FAIL":
-                final_status = "FAIL"
-                if not error_msg:
-                    error_msg = result.get("error", "")
+            # Black check juga warning (tidak ubah status)
+            if result.get("details") and result["status"] == "FAIL":
+                all_details[check.name]["warning"] = True
 
         # =============================================
         # JALANKAN AUDIO/METADATA CHECKS
@@ -147,17 +149,16 @@ def qc_process_file(file_path, log_callback, progress_callback):
             result = check.run(file_path, log_callback, lambda x: None)
             all_details[check.name] = result.get("details", {})
             
-            if result["status"] == "FAIL":
-                final_status = "FAIL"
-                if not error_msg:
-                    error_msg = result.get("error", "")
+            # Audio checks juga warning (tidak ubah status)
+            if result.get("details") and result["status"] == "FAIL":
+                all_details[check.name]["warning"] = True
 
         # =============================================
-        # RETURN HASIL
+        # RETURN HASIL (Status tetap PASS)
         # =============================================
         return {
             "file": file_name,
-            "status": final_status,
+            "status": final_status,  # Selalu PASS selama metadata valid
             "freeze": all_freeze,
             "details": all_details,
             "error": error_msg
@@ -181,8 +182,5 @@ def qc_process_file(file_path, log_callback, progress_callback):
         if temp_file and DELETE_TEMP:
             cleanup_temp_file(temp_file)
             log_callback("Temporary file cleaned up")
-            # =====================================================
-            # TAMBAHAN: NAMA FILE + FINISH QC
-            # =====================================================
-            # log_callback(f"✅ {file_name} FINISH QC")
+            log_callback(f"✅ {file_name} FINISH QC")
             log_callback("══════════════════════════════════════════════════")
